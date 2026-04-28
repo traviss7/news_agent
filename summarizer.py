@@ -1,35 +1,42 @@
-"""Claude-powered news summarizer with prompt caching."""
-import anthropic
+"""Gemini-powered news summarizer (REST API, no SDK needed)."""
+import os
+import json
+import re
+import requests
 from scraper import Article
 
-SYSTEM_PROMPT = """You are an AI news analyst. Your job is to analyze a list of AI-related news articles and produce a structured daily briefing in Korean.
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-1.5-flash:generateContent"
+)
 
-For each article provided, assign an importance score from 1-10 based on:
-- Impact on AI industry/research (higher = more impactful)
-- Novelty and newsworthiness
-- Relevance to practitioners and researchers
+SYSTEM_PROMPT = """You are an AI news analyst. Analyze the given AI news articles and return a JSON array.
 
-Then return a JSON array with the following structure for each article:
-{
-  "title": "original title",
-  "source": "source name",
-  "url": "article url",
-  "importance_score": <1-10>,
-  "korean_summary": "2-3 sentence Korean summary of the article",
-  "tags": ["tag1", "tag2"]  // e.g. ["LLM", "연구", "산업", "규제", "오픈소스"]
-}
+For each article assign an importance score 1-10 based on industry impact, novelty, and relevance.
 
-Sort the array by importance_score descending.
-Respond ONLY with the JSON array, no other text."""
+Return ONLY a JSON array, no other text:
+[
+  {
+    "title": "original title",
+    "url": "article url",
+    "importance_score": <1-10>,
+    "korean_summary": "2-3 sentence Korean summary",
+    "tags": ["tag1", "tag2"]
+  }
+]
 
-client = anthropic.Anthropic()
+Sort by importance_score descending."""
 
 
 def summarize_articles(articles: list[Article]) -> list[Article]:
     if not articles:
         return []
 
-    # Build article list for the prompt
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("[summarizer] GEMINI_API_KEY not set — skipping summarization")
+        return articles
+
     article_texts = []
     for i, a in enumerate(articles, 1):
         article_texts.append(
@@ -39,26 +46,27 @@ def summarize_articles(articles: list[Article]) -> list[Article]:
             f"    Excerpt: {a.summary[:300] if a.summary else '(no excerpt)'}"
         )
 
-    user_content = "Analyze the following AI news articles:\n\n" + "\n\n".join(article_texts)
+    user_content = SYSTEM_PROMPT + "\n\nAnalyze these AI news articles:\n\n" + "\n\n".join(article_texts)
 
-    response = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=8096,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_content}],
-    )
+    payload = {
+        "contents": [{"parts": [{"text": user_content}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+    }
 
-    import json, re
+    try:
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": api_key},
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[summarizer] Gemini API error: {e}")
+        return articles
 
-    raw = next((b.text for b in response.content if b.type == "text"), "[]")
-    # strip possible markdown code fences
-    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     try:
@@ -67,14 +75,12 @@ def summarize_articles(articles: list[Article]) -> list[Article]:
         print(f"[summarizer] JSON parse error: {e}")
         return articles
 
-    # map back to Article objects
     url_map = {a.url: a for a in articles}
     enriched: list[Article] = []
     for item in items:
         url = item.get("url", "")
         art = url_map.get(url)
         if art is None:
-            # fallback: match by title
             title = item.get("title", "")
             art = next((a for a in articles if a.title == title), None)
         if art is None:
@@ -84,7 +90,6 @@ def summarize_articles(articles: list[Article]) -> list[Article]:
         art.tags = item.get("tags", art.tags)
         enriched.append(art)
 
-    # articles not returned by Claude keep their defaults
     returned_urls = {a.url for a in enriched}
     for a in articles:
         if a.url not in returned_urls:

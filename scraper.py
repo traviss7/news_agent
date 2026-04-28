@@ -1,61 +1,20 @@
-"""RSS-based AI news scraper."""
-import feedparser
+"""AI news scraper — Google News RSS (server-friendly)."""
+import re
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 FEEDS = [
-    {
-        "name": "MIT Technology Review – AI",
-        "url": "https://www.technologyreview.com/feed/",
-        "tag": "MIT",
-    },
-    {
-        "name": "The Verge – AI",
-        "url": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-        "tag": "Verge",
-    },
-    {
-        "name": "VentureBeat – AI",
-        "url": "https://venturebeat.com/category/ai/feed/",
-        "tag": "VentureBeat",
-    },
-    {
-        "name": "TechCrunch – AI",
-        "url": "https://techcrunch.com/category/artificial-intelligence/feed/",
-        "tag": "TechCrunch",
-    },
-    {
-        "name": "Wired – AI",
-        "url": "https://www.wired.com/feed/tag/ai/latest/rss",
-        "tag": "Wired",
-    },
-    {
-        "name": "Ars Technica – AI",
-        "url": "https://feeds.arstechnica.com/arstechnica/technology-lab",
-        "tag": "Ars",
-    },
-    {
-        "name": "Google DeepMind Blog",
-        "url": "https://deepmind.google/blog/rss.xml",
-        "tag": "DeepMind",
-    },
-    {
-        "name": "OpenAI Blog",
-        "url": "https://openai.com/blog/rss.xml",
-        "tag": "OpenAI",
-    },
-    {
-        "name": "Anthropic News",
-        "url": "https://www.anthropic.com/rss.xml",
-        "tag": "Anthropic",
-    },
-    {
-        "name": "HuggingFace Blog",
-        "url": "https://huggingface.co/blog/feed.xml",
-        "tag": "HuggingFace",
-    },
+    {"name": "Google News – AI", "url": "https://news.google.com/rss/search?q=artificial+intelligence&hl=en&gl=US&ceid=US:en", "tag": "AI"},
+    {"name": "Google News – LLM", "url": "https://news.google.com/rss/search?q=LLM+large+language+model&hl=en&gl=US&ceid=US:en", "tag": "LLM"},
+    {"name": "Google News – OpenAI", "url": "https://news.google.com/rss/search?q=OpenAI+ChatGPT&hl=en&gl=US&ceid=US:en", "tag": "OpenAI"},
+    {"name": "Google News – Gemini", "url": "https://news.google.com/rss/search?q=Google+Gemini+AI&hl=en&gl=US&ceid=US:en", "tag": "Google"},
+    {"name": "Google News – Claude", "url": "https://news.google.com/rss/search?q=Anthropic+Claude+AI&hl=en&gl=US&ceid=US:en", "tag": "Anthropic"},
+    {"name": "Google News – AI Research", "url": "https://news.google.com/rss/search?q=AI+research+paper+2025&hl=en&gl=US&ceid=US:en", "tag": "Research"},
+    {"name": "Google News – AI 한국", "url": "https://news.google.com/rss/search?q=인공지능+AI&hl=ko&gl=KR&ceid=KR:ko", "tag": "국내"},
 ]
 
 
@@ -71,62 +30,80 @@ class Article:
     tags: list[str] = field(default_factory=list)
 
 
-def _parse_date(entry) -> Optional[datetime]:
-    for attr in ("published_parsed", "updated_parsed"):
-        t = getattr(entry, attr, None)
-        if t:
-            try:
-                return datetime(*t[:6], tzinfo=timezone.utc)
-            except Exception:
-                pass
-    return None
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())[:500]
 
 
-def _entry_summary(entry) -> str:
-    for attr in ("summary", "description", "content"):
-        val = getattr(entry, attr, None)
-        if val:
-            if isinstance(val, list):
-                val = val[0].get("value", "")
-            # strip HTML tags simply
-            import re
-            val = re.sub(r"<[^>]+>", " ", str(val))
-            val = " ".join(val.split())
-            return val[:500]
-    return ""
+def _parse_date(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    try:
+        return parsedate_to_datetime(text).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_feed(content: bytes, source: str, tag: str,
+                cutoff: datetime, max_count: int) -> list[Article]:
+    articles = []
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
+
+    channel = root.find("channel") or root
+    items = channel.findall("item")
+    seen_titles = set()
+
+    for item in items:
+        if len(articles) >= max_count:
+            break
+
+        title_el = item.find("title")
+        title = (title_el.text or "").strip() if title_el is not None else "(no title)"
+        # Google News prepends "source - " to titles, clean it up
+        if " - " in title:
+            parts = title.rsplit(" - ", 1)
+            title = parts[0].strip()
+
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+
+        link_el = item.find("link")
+        url = (link_el.text or "").strip() if link_el is not None else ""
+
+        pub_el = item.find("pubDate")
+        pub = _parse_date(pub_el.text if pub_el is not None else None)
+        if pub and pub < cutoff:
+            continue
+
+        desc_el = item.find("description")
+        summary = _strip_html(desc_el.text or "") if desc_el is not None else ""
+
+        articles.append(Article(
+            title=title, url=url, source=source,
+            published=pub, summary=summary, tags=[tag]
+        ))
+
+    return articles
 
 
 def fetch_articles(hours_back: int = 24, max_per_feed: int = 10) -> list[Article]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
-    articles: list[Article] = []
     headers = {"User-Agent": "Mozilla/5.0 (compatible; AINewsBot/1.0)"}
+    all_articles: list[Article] = []
 
-    for feed_info in FEEDS:
+    for feed in FEEDS:
         try:
-            resp = requests.get(feed_info["url"], headers=headers, timeout=15)
+            resp = requests.get(feed["url"], headers=headers, timeout=15)
             resp.raise_for_status()
-            feed = feedparser.parse(resp.content)
+            arts = _parse_feed(resp.content, feed["name"], feed["tag"],
+                               cutoff, max_per_feed)
+            print(f"[scraper] {feed['name']}: {len(arts)}건")
+            all_articles.extend(arts)
         except Exception as e:
-            print(f"[scraper] Failed to fetch {feed_info['name']}: {e}")
-            continue
+            print(f"[scraper] 실패 {feed['name']}: {e}")
 
-        count = 0
-        for entry in feed.entries:
-            if count >= max_per_feed:
-                break
-            pub = _parse_date(entry)
-            # include articles without a date, or those within the window
-            if pub and pub < cutoff:
-                continue
-            article = Article(
-                title=getattr(entry, "title", "(no title)").strip(),
-                url=getattr(entry, "link", ""),
-                source=feed_info["name"],
-                published=pub,
-                summary=_entry_summary(entry),
-                tags=[feed_info["tag"]],
-            )
-            articles.append(article)
-            count += 1
-
-    return articles
+    return all_articles
